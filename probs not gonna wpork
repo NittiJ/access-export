@@ -1,0 +1,126 @@
+library(tidyverse)
+library(readr)
+library(readxl)
+library(RODBC)
+library(fs)
+library(stringr)
+library(vroom)
+
+# --- PATHS ---
+bdc_path <- "C:/BDC/"
+bpd_rdata <- "C:/RCode/20250603_BPDFile.RData"
+recognition_file <- "C:/BDC/recognition messaging.xlsx"
+blank_shell <- "C:/BDC/blank_.accdb"
+access_target <- file.path(bdc_path, paste0("BDC_", Sys.Date(), ".accdb"))
+
+# --- STEP 1: Load Final_Data_Full ---
+load(bpd_rdata)
+
+# --- STEP 2: Process BDC Files Chunk-by-Chunk with Filter & Dedup ---
+bdc_files <- list.files(bdc_path, pattern = "\\.txt\\.gz$", full.names = TRUE)
+temp_file <- tempfile(fileext = ".csv")
+if (file_exists(temp_file)) file_delete(temp_file)
+
+for (file in bdc_files) {
+  message("Reading: ", basename(file))
+  
+  chunk <- vroom::vroom(file, delim = "|", col_types = cols(.default = "c")) %>%
+    rename(PROV_MSTR_LOC_ID = BCBSA_PROV_MSTR_LOC_ID) %>%
+    mutate(across(where(is.character), str_to_upper)) %>%
+    filter(Designation_TYPE %in% c("BDC", "BDC+", "CC")) %>%
+    distinct(BCBSA_MSTR_PROV_ID, PROV_MSTR_LOC_ID, Designation_TYPE, .keep_all = TRUE)
+  
+  write_csv(chunk, temp_file, append = file_exists(temp_file))
+}
+
+BDC_Data <- vroom(temp_file, col_types = cols(.default = "c")) %>%
+  distinct(BCBSA_MSTR_PROV_ID, PROV_MSTR_LOC_ID, .keep_all = TRUE)
+
+# --- STEP 3: Join to Final_Data_Full ---
+Matched_BDC <- Final_Data_Full %>%
+  left_join(BDC_Data, by = c("BCBSA_MSTR_PROV_ID", "PROV_MSTR_LOC_ID")) %>%
+  distinct(BCBSA_MSTR_PROV_ID, PROV_MSTR_LOC_ID, .keep_all = TRUE)
+
+# --- STEP 4: Attach Recognition Program Info ---
+recognition_lookup <- read_excel(recognition_file) %>%
+  mutate(
+    Group_Name = str_remove(Title1, "^BLUE DISTINCTION CENTERS\\+? FOR ") %>% str_trim(),
+    Group_Name = paste0(Group_Name, if_else(str_detect(Title1, "\\+"), "+", ""))
+  ) %>%
+  select(Code1, Code2, Title1, Title2, Group_Name)
+
+Matched_BDC <- Matched_BDC %>%
+  left_join(
+    recognition_lookup,
+    by = c("RECOGNTN_ENTITY_CD" = "Code1", "Recogntn_Value_CD" = "Code2")
+  )
+
+# --- STEP 5: Final Access Export Dataset ---
+BDC_Final <- Matched_BDC %>%
+  mutate(
+    PROVIDER_NAME = if_else(!is.na(LAST_NAME), paste(FIRST_NAME, LAST_NAME), ORG_NAME),
+    NTWK = "",
+    PROVTYPE = "",
+    TAXONOMY = TXNMY_CD,
+    RowId = row_number(),
+    Latitude = NA_character_,
+    Longitude = NA_character_,
+    GeoInfo = NA_character_,
+    StandardZip = NA_character_,
+    StandardStat = NA_character_,
+    CountySSA = NA_character_,
+    Recognition_Category = Group_Name
+  ) %>%
+  transmute(
+    NTWK,
+    PROVTYPE,
+    NPI,
+    PROVIDER_NAME,
+    ADDRESS = PROV_ADDR_LINE_1,
+    CITY = PROV_ADRS_CITY,
+    STATE = PROV_ADRS_ST,
+    ZIP_5 = PROV_ADRS_ZIP_CD,
+    TAXONOMY,
+    RowId,
+    Latitude,
+    Longitude,
+    GeoInfo,
+    StandardZip,
+    StandardStat,
+    CountySSA,
+    Recognition_Category,
+    RECOGNTN_ENTITY_CD,
+    Recogntn_Value_CD,
+    Designation_TYPE
+  ) %>%
+  distinct()
+
+# --- STEP 6: Copy Access Shell ---
+file_copy(blank_shell, access_target, overwrite = TRUE)
+
+# --- STEP 7: Chunked Write to Access ---
+conn <- odbcDriverConnect(paste0("Driver={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=", access_target))
+chunk_size <- 10000
+n <- nrow(BDC_Final)
+
+# Write initial chunk
+start <- 1
+end <- min(start + chunk_size - 1, n)
+chunk <- BDC_Final[start:end, ]
+sqlSave(conn, chunk, tablename = "NTWK", rownames = FALSE, append = FALSE, safer = TRUE)
+
+# Write remaining chunks
+if (n > chunk_size) {
+  for (start in seq(chunk_size + 1, n, by = chunk_size)) {
+    end <- min(start + chunk_size - 1, n)
+    chunk <- BDC_Final[start:end, ]
+    sqlSave(conn, chunk, tablename = "NTWK", rownames = FALSE, append = TRUE, safer = TRUE)
+    message("Appended rows ", start, " to ", end)
+  }
+}
+
+# --- STEP 8: Final Cleanup ---
+odbcClose(conn)
+message("✅ Access database successfully written to: ", access_target)
+rm(list = ls())
+gc()
