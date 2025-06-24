@@ -1,0 +1,116 @@
+library(tidyverse)
+library(readr)
+library(readxl)
+library(RODBC)
+library(fs)
+library(stringr)
+library(vroom)
+
+# --- PATHS ---
+bdc_path <- "C:/BDC/"
+recognition_file <- "C:/BDC/recognition messaging.xlsx"
+blank_shell <- "C:/BDC/blank_.accdb"
+access_target <- file.path(bdc_path, paste0("BDC_", Sys.Date(), ".accdb"))
+
+# --- STEP 1: Read and Combine ALL BDC .txt.gz Files (NO dedup yet) ---
+bdc_files <- list.files(bdc_path, pattern = "\\.txt\\.gz$", full.names = TRUE)
+
+BDC_Data <- map_dfr(bdc_files, function(file) {
+  message("Reading: ", basename(file))
+  vroom::vroom(file, delim = "|", col_types = cols(.default = "c")) %>%
+    rename(PROV_MSTR_LOC_ID = BCBSA_PROV_MSTR_LOC_ID) %>%
+    mutate(across(where(is.character), str_to_upper))
+})
+
+# --- STEP 2: Attach Recognition Program Info ---
+recognition_lookup <- read_excel(recognition_file) %>%
+  mutate(
+    Group_Name = str_remove(Title1, "^BLUE DISTINCTION CENTERS\\+? FOR ") %>% str_trim(),
+    Group_Name = paste0(Group_Name, if_else(str_detect(Title1, "\\+"), "+", ""))
+  ) %>%
+  select(Code1, Code2, Title1, Title2, Group_Name)
+
+Matched_BDC <- BDC_Data %>%
+  left_join(
+    recognition_lookup,
+    by = c("RECOGNTN_ENTITY_CD" = "Code1", "Recogntn_Value_CD" = "Code2")
+  )
+
+# --- STEP 3: Build Final Dataset for Access ---
+BDC_Final <- Matched_BDC %>%
+  mutate(
+    PROVIDER_NAME = if_else(!is.na(PROV_LAST_NM), paste(PROV_FRST_NM, PROV_LAST_NM), PROV_ORG_NM),
+    NTWK = "",
+    PROVTYPE = "",
+    TAXONOMY = "",  # TXNMY_CD not present in BDC raw data — override here or map if needed
+    RowId = row_number(),
+    Latitude = NA_character_,
+    Longitude = NA_character_,
+    GeoInfo = NA_character_,
+    StandardZip = NA_character_,
+    StandardStat = NA_character_,
+    CountySSA = NA_character_,
+    Recognition_Category = Group_Name
+  ) %>%
+  transmute(
+    NTWK,
+    PROVTYPE,
+    NPI = PROV_NPI,
+    PROVIDER_NAME,
+    ADDRESS = PROV_ADDRS1,
+    CITY = PROV_CITY,
+    STATE = Provider_STATE,
+    ZIP_5 = Provider_Zip_CODE,
+    TAXONOMY,
+    RowId,
+    Latitude,
+    Longitude,
+    GeoInfo,
+    StandardZip,
+    StandardStat,
+    CountySSA,
+    Recognition_Category,
+    RECOGNTN_ENTITY_CD,
+    Recogntn_Value_CD,
+    Designation_TYPE
+  ) %>%
+  filter(Designation_TYPE %in% c("BDC", "BDC+", "CC")) %>%
+  distinct(
+    NPI,
+    PROVIDER_NAME,
+    ADDRESS,
+    CITY,
+    STATE,
+    ZIP_5,
+    Designation_TYPE,
+    Recognition_Category,
+    .keep_all = TRUE
+  )
+
+# --- STEP 4: Export to Access ---
+file_copy(blank_shell, access_target, overwrite = TRUE)
+
+conn <- odbcDriverConnect(paste0("Driver={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=", access_target))
+chunk_size <- 10000
+n <- nrow(BDC_Final)
+
+# Write first chunk
+start <- 1
+end <- min(start + chunk_size - 1, n)
+chunk <- BDC_Final[start:end, ]
+sqlSave(conn, chunk, tablename = "NTWK", rownames = FALSE, append = FALSE, safer = TRUE)
+
+# Write remaining chunks
+if (n > chunk_size) {
+  for (start in seq(chunk_size + 1, n, by = chunk_size)) {
+    end <- min(start + chunk_size - 1, n)
+    chunk <- BDC_Final[start:end, ]
+    sqlSave(conn, chunk, tablename = "NTWK", rownames = FALSE, append = TRUE, safer = TRUE)
+    message("Appended rows ", start, " to ", end)
+  }
+}
+
+odbcClose(conn)
+message("✅ Access database successfully written to: ", access_target)
+rm(list = ls())
+gc()
