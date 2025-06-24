@@ -1,0 +1,10 @@
+  distinct(
+    NPI,
+    PROVIDER_NAME,
+    TAXONOMY,
+    RECOGNTN_ENTITY_CD,
+    Recogntn_Value_CD,
+    Designation_TYPE,
+    Recognition_Category,
+    .keep_all = TRUE
+  )
