@@ -1,0 +1,164 @@
+library(tidyverse)
+library(readr)
+library(readxl)
+library(RODBC)
+library(fs)
+library(stringr)
+library(vroom)
+
+# --- PATHS ---
+bdc_path <- "C:/BDC/"
+bpd_rdata <- "C:/RCode/20250603_BPDFile.RData"
+recognition_file <- "C:/BDC/recognition messaging.xlsx"
+blank_shell <- "C:/BDC/blank_.accdb"
+access_target <- file.path(bdc_path, paste0("BDC_", Sys.Date(), ".accdb"))
+
+# --- STEP 1: Load and Prepare Final_Data_Full (BPD) ---
+load(bpd_rdata)
+
+Final_Keys <- Final_Data_Full %>%
+  mutate(across(where(is.character), str_to_upper)) %>%
+  select(
+    BCBSA_MSTR_PROV_ID,
+    PROV_MSTR_LOC_ID,
+    NPI,
+    TXNMY_CD,
+    PROV_ADDR_LINE_1,
+    PROV_ADRS_CITY,
+    PROV_ADRS_ST,
+    PROV_ADRS_ZIP_CD,
+    FIRST_NAME,
+    LAST_NAME,
+    ORG_NAME
+  ) %>%
+  distinct(
+    BCBSA_MSTR_PROV_ID,
+    PROV_MSTR_LOC_ID,
+    NPI,
+    TXNMY_CD,
+    .keep_all = TRUE
+  )
+
+# --- STEP 2: Read All BDC .txt.gz Files ---
+bdc_files <- list.files(bdc_path, pattern = "\\.txt\\.gz$", full.names = TRUE)
+
+BDC_Data <- map_dfr(bdc_files, function(file) {
+  message("Reading: ", basename(file))
+  vroom(file, delim = "|", col_types = cols(.default = "c")) %>%
+    rename(PROV_MSTR_LOC_ID = BCBSA_PROV_MSTR_LOC_ID) %>%
+    mutate(across(where(is.character), str_to_upper)) %>%
+    filter(Designation_TYPE %in% c("BDC", "BDC+", "CC"))
+})
+
+# --- STEP 3: Keep Only BDC Rows That Exist in BPD Using semi_join ---
+Valid_BDC <- BDC_Data %>%
+  semi_join(
+    Final_Keys,
+    by = c(
+      "BCBSA_MSTR_PROV_ID",
+      "PROV_MSTR_LOC_ID",
+      "PROV_NPI" = "NPI",
+      "TXNMY_CD"
+    )
+  )
+
+# --- STEP 4: Enrich BDC Rows with Address/Name from BPD ---
+Enriched_BDC <- Valid_BDC %>%
+  left_join(
+    Final_Keys,
+    by = c(
+      "BCBSA_MSTR_PROV_ID",
+      "PROV_MSTR_LOC_ID",
+      "PROV_NPI" = "NPI",
+      "TXNMY_CD"
+    )
+  )
+
+# --- STEP 5: Join Recognition Program Info ---
+recognition_lookup <- read_excel(recognition_file) %>%
+  mutate(
+    Group_Name = str_remove(Title1, "^BLUE DISTINCTION CENTERS\\+? FOR ") %>% str_trim(),
+    Group_Name = paste0(Group_Name, if_else(str_detect(Title1, "\\+"), "+", ""))
+  ) %>%
+  select(Code1, Code2, Group_Name)
+
+Enriched_BDC <- Enriched_BDC %>%
+  left_join(
+    recognition_lookup,
+    by = c("RECOGNTN_ENTITY_CD" = "Code1", "Recogntn_Value_CD" = "Code2")
+  )
+
+# --- STEP 6: Prepare for Export + Deduplication ---
+BDC_Final <- Enriched_BDC %>%
+  mutate(
+    PROVIDER_NAME = if_else(!is.na(LAST_NAME), paste(FIRST_NAME, LAST_NAME), ORG_NAME),
+    NTWK = "",
+    PROVTYPE = "",
+    TAXONOMY = TXNMY_CD,
+    RowId = row_number(),
+    Latitude = Longitude <- GeoInfo <- StandardZip <- StandardStat <- CountySSA <- NA_character_,
+    Recognition_Category = Group_Name
+  ) %>%
+  transmute(
+    NTWK,
+    PROVTYPE,
+    NPI = PROV_NPI,
+    PROVIDER_NAME,
+    ADDRESS = PROV_ADDR_LINE_1,
+    CITY = PROV_ADRS_CITY,
+    STATE = PROV_ADRS_ST,
+    ZIP_5 = PROV_ADRS_ZIP_CD,
+    TAXONOMY,
+    RowId,
+    Latitude,
+    Longitude,
+    GeoInfo,
+    StandardZip,
+    StandardStat,
+    CountySSA,
+    Recognition_Category,
+    RECOGNTN_ENTITY_CD,
+    Recogntn_Value_CD,
+    Designation_TYPE
+  ) %>%
+  distinct(
+    NPI,
+    PROVIDER_NAME,
+    ADDRESS,
+    CITY,
+    STATE,
+    ZIP_5,
+    TAXONOMY,
+    Designation_TYPE,
+    Recognition_Category,
+    .keep_all = TRUE
+  )
+
+# --- STEP 7: Export to Access in Chunks ---
+file_copy(blank_shell, access_target, overwrite = TRUE)
+
+conn <- odbcDriverConnect(paste0("Driver={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=", access_target))
+
+chunk_size <- 10000
+n <- nrow(BDC_Final)
+
+# First chunk
+start <- 1
+end <- min(start + chunk_size - 1, n)
+chunk <- BDC_Final[start:end, ]
+sqlSave(conn, chunk, tablename = "NTWK", rownames = FALSE, append = FALSE, safer = TRUE)
+
+# Remaining chunks
+if (n > chunk_size) {
+  for (start in seq(chunk_size + 1, n, by = chunk_size)) {
+    end <- min(start + chunk_size - 1, n)
+    chunk <- BDC_Final[start:end, ]
+    sqlSave(conn, chunk, tablename = "NTWK", rownames = FALSE, append = TRUE, safer = TRUE)
+    message("Appended rows ", start, " to ", end)
+  }
+}
+
+odbcClose(conn)
+message("✅ Access export complete: ", access_target)
+rm(list = ls())
+gc()
