@@ -1,2 +1,13 @@
 CA_Data <- `CA Data`
 conn_hmo_rows <- CA_Data[CA_Data$NTWK == "CONNHMO", ]
+
+
+
+
+library(dplyr)
+
+`CA Data` %>% 
+  distinct(NTWK)
+
+
+unique(`CA Data`$NTWK)
