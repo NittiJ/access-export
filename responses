@@ -1,0 +1,13 @@
+I wanted to flag a potential inconsistency in the geo access requirements outlined for this analysis.
+
+The request lists a provider access standard of 2 ophthalmologists and optometrists within 15 miles, which is clear and straightforward. However, it also requests that we provide the average number of providers within 10 miles (and in some places 20 miles) for those same provider types.
+
+This creates a conflict — the average count in 10 miles could appear artificially low compared to the 15-mile access standard, while the 20-mile average inflates availability well beyond the actual standard.
+
+To ensure the report aligns with the intent of the access criteria and gives a meaningful picture of provider availability:
+
+Should we base both the access metric and the average provider count on the same 15-mile radius?
+
+Or are the different distance ranges intended for separate purposes?
+
+Happy to adjust the logic either way, just wanted to confirm before finalizing the analysis.
